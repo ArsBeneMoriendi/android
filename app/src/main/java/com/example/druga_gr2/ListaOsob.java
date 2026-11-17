@@ -1,169 +1,217 @@
 package com.example.druga_gr2;
 
-import android.content.ContentValues;
 import android.content.Context;
-import android.database.sqlite.SQLiteDatabase;
-import android.database.sqlite.SQLiteException;
-
+import android.os.Handler;
+import android.os.Looper;
+import com.example.druga_gr2.database.AdresEntity;
+import com.example.druga_gr2.database.AppDatabase;
+import com.example.druga_gr2.database.OsobaEntity;
+import com.example.druga_gr2.database.OsobaZAdresem;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ListaOsob {
-    private static ListaOsob mLista;
-    private final SQLiteDatabase database;
-
-    private static final String SELECT_OSOBY = "SELECT o.OsobaUuid AS OsobaUuid, "
-            + "o.Imie AS Imie, o.Nazwisko AS Nazwisko, a.AdresUuid AS AdresUuid, "
-            + "a.Miasto AS Miasto, a.Ulica AS Ulica, a.NumerDomu AS NumerDomu, "
-            + "a.KodPocztowy AS KodPocztowy FROM Osoby o "
-            + "LEFT JOIN Adres a ON o.AdresUuid = a.AdresUuid";
-
-    private ListaOsob(Context context) {
-        this(new OsobyDBH(context.getApplicationContext()).getWritableDatabase());
+    public interface Callback<T> {
+        void onSuccess(T wynik);
+        void onError(Exception blad);
     }
 
-    ListaOsob(SQLiteDatabase database) {
+    private static ListaOsob instance;
+    private final AppDatabase database;
+    private final ExecutorService executor;
+    private final Handler mainHandler;
+
+    private ListaOsob(Context context) {
+        this(AppDatabase.getInstance(context), Executors.newSingleThreadExecutor(),
+                new Handler(Looper.getMainLooper()));
+    }
+
+    ListaOsob(AppDatabase database, ExecutorService executor, Handler mainHandler) {
         this.database = database;
+        this.executor = executor;
+        this.mainHandler = mainHandler;
     }
 
     public static synchronized ListaOsob get(Context context) {
-        if (mLista == null) {
-            mLista = new ListaOsob(context);
-        }
-        return mLista;
+        if (instance == null) instance = new ListaOsob(context.getApplicationContext());
+        return instance;
     }
 
-    public synchronized List<Osoba> pobierzOsoby() {
-        List<Osoba> osoby = new ArrayList<>();
-        try (OsobyCursorWrapper cursor = new OsobyCursorWrapper(
-                database.rawQuery(SELECT_OSOBY + " ORDER BY o._id", null))) {
-            while (cursor.moveToNext()) {
-                osoby.add(cursor.getOsoba());
+    public void pobierzOsoby(Callback<List<Osoba>> callback) {
+        wykonaj(() -> {
+            List<Osoba> wynik = new ArrayList<>();
+            for (OsobaZAdresem relacja : database.osobaDao().pobierzOsobyZAdresami()) {
+                wynik.add(model(relacja));
             }
-        }
-        return osoby;
+            return wynik;
+        }, callback);
     }
 
-    public synchronized Osoba pobierzOsobe(String uuid) {
-        sprawdzUuid(uuid);
-        try (OsobyCursorWrapper cursor = new OsobyCursorWrapper(
-                database.rawQuery(SELECT_OSOBY + " WHERE o.OsobaUuid = ?", new String[]{uuid}))) {
-            return cursor.moveToFirst() ? cursor.getOsoba() : null;
-        }
+    public void pobierzOsobe(String uuid, Callback<Osoba> callback) {
+        wykonaj(() -> {
+            sprawdzUuid(uuid);
+            OsobaZAdresem relacja = database.osobaDao().pobierzOsobeZAdresem(uuid);
+            return relacja == null ? null : model(relacja);
+        }, callback);
     }
 
-    public synchronized void dodajOsobe(Osoba osoba) {
-        database.beginTransaction();
-        try {
-            if (osoba.getAdres() != null) {
-                database.insertOrThrow(OsobyDB.AdresTabela.Name, null,
-                        getContentValuesAdres(osoba.getAdres()));
-            }
-            database.insertOrThrow(OsobyDB.OsobyTabela.Name, null, getContentValuesOsoba(osoba));
-            database.setTransactionSuccessful();
-        } finally {
-            database.endTransaction();
-        }
+    public void dodajOsobe(Osoba osoba, Callback<Void> callback) {
+        Osoba kopia = kopiuj(osoba);
+        wykonaj(() -> {
+            OsobaEntity encja = encja(kopia);
+            database.runInTransaction(() -> {
+                zapiszAdres(kopia.getAdres());
+                database.osobaDao().dodajOsobe(encja);
+            });
+            return null;
+        }, callback);
     }
 
-    public synchronized void zmienOsobe(Osoba osoba) {
-        database.beginTransaction();
-        try {
-            Osoba poprzednia = wymaganaOsoba(osoba.getmIdOsoba());
-            String staryAdres = poprzednia.getAdres() == null
-                    ? null : poprzednia.getAdres().getIdAdres();
-            String nowyAdres = osoba.getAdres() == null ? null : osoba.getAdres().getIdAdres();
-
-            if (osoba.getAdres() != null) {
-                if (Objects.equals(staryAdres, nowyAdres)) {
-                    zmienAdres(osoba.getAdres());
-                } else {
-                    database.insertOrThrow(OsobyDB.AdresTabela.Name, null,
-                            getContentValuesAdres(osoba.getAdres()));
+    public void zmienOsobe(Osoba osoba, Callback<Void> callback) {
+        Osoba kopia = kopiuj(osoba);
+        wykonaj(() -> {
+            OsobaEntity encja = encja(kopia);
+            database.runInTransaction(() -> {
+                OsobaEntity stara = wymaganaOsoba(encja.uuid);
+                encja.id = stara.id;
+                zapiszAdres(kopia.getAdres());
+                wymaganyJeden(database.osobaDao().aktualizujOsobe(encja));
+                if (stara.adresUuid != null && !Objects.equals(stara.adresUuid, encja.adresUuid)) {
+                    database.adresDao().usunJesliNieuzywany(stara.adresUuid);
                 }
+            });
+            return null;
+        }, callback);
+    }
+
+    public void usunOsobe(String uuid, Callback<Void> callback) {
+        wykonaj(() -> {
+            sprawdzUuid(uuid);
+            database.runInTransaction(() -> {
+                OsobaEntity osoba = wymaganaOsoba(uuid);
+                wymaganyJeden(database.osobaDao().usunOsobe(osoba));
+                if (osoba.adresUuid != null) database.adresDao().usunJesliNieuzywany(osoba.adresUuid);
+            });
+            return null;
+        }, callback);
+    }
+
+    public void zmienAdres(Adres adres, Callback<Void> callback) {
+        Adres kopia = kopiujAdres(adres);
+        wykonaj(() -> {
+            wymaganyJeden(database.adresDao().aktualizujAdres(encjaAdresu(kopia)));
+            return null;
+        }, callback);
+    }
+
+    public void usunAdres(String uuid, Callback<Void> callback) {
+        wykonaj(() -> {
+            sprawdzUuid(uuid);
+            database.runInTransaction(() -> {
+                AdresEntity adres = database.adresDao().pobierzAdres(uuid);
+                if (adres == null) throw new IllegalStateException("Adres nie istnieje");
+                wymaganyJeden(database.adresDao().usunAdres(adres));
+            });
+            return null;
+        }, callback);
+    }
+
+    private <T> void wykonaj(Callable<T> operacja, Callback<T> callback) {
+        executor.execute(() -> {
+            final T wynik;
+            try {
+                wynik = operacja.call();
+            } catch (Exception blad) {
+                mainHandler.post(() -> callback.onError(blad));
+                return;
             }
-            wymaganyJeden(database.update(OsobyDB.OsobyTabela.Name,
-                    getContentValuesOsoba(osoba), "OsobaUuid = ?",
-                    new String[]{osoba.getmIdOsoba()}));
-            if (staryAdres != null && !Objects.equals(staryAdres, nowyAdres)) {
-                usunAdres(staryAdres);
-            }
-            database.setTransactionSuccessful();
-        } finally {
-            database.endTransaction();
-        }
+            mainHandler.post(() -> callback.onSuccess(wynik));
+        });
     }
 
-    public synchronized void usunOsobe(String uuid) {
-        database.beginTransaction();
-        try {
-            Osoba osoba = wymaganaOsoba(uuid);
-            wymaganyJeden(database.delete(OsobyDB.OsobyTabela.Name,
-                    "OsobaUuid = ?", new String[]{uuid}));
-            if (osoba.getAdres() != null) {
-                usunAdres(osoba.getAdres().getIdAdres());
-            }
-            database.setTransactionSuccessful();
-        } finally {
-            database.endTransaction();
-        }
-    }
-
-    public synchronized void zmienAdres(Adres adres) {
-        wymaganyJeden(database.update(OsobyDB.AdresTabela.Name,
-                getContentValuesAdres(adres), "AdresUuid = ?", new String[]{adres.getIdAdres()}));
-    }
-
-    public synchronized void usunAdres(String uuid) {
-        sprawdzUuid(uuid);
-        wymaganyJeden(database.delete(OsobyDB.AdresTabela.Name,
-                "AdresUuid = ?", new String[]{uuid}));
-    }
-
-    public static ContentValues getContentValuesOsoba(Osoba osoba) {
-        sprawdzUuid(osoba.getmIdOsoba());
-        ContentValues values = new ContentValues();
-        values.put(OsobyDB.OsobyTabela.Kolumny.UUID, osoba.getmIdOsoba());
-        values.put(OsobyDB.OsobyTabela.Kolumny.IMIE, osoba.getImie());
-        values.put(OsobyDB.OsobyTabela.Kolumny.NAZWISKO, osoba.getNazwisko());
-        if (osoba.getAdres() == null) {
-            values.putNull(OsobyDB.OsobyTabela.Kolumny.ADRES_UUID);
+    private void zapiszAdres(Adres adres) {
+        if (adres == null) return;
+        AdresEntity encja = encjaAdresu(adres);
+        if (database.adresDao().pobierzAdres(encja.uuid) == null) {
+            database.adresDao().dodajAdres(encja);
         } else {
-            sprawdzUuid(osoba.getAdres().getIdAdres());
-            values.put(OsobyDB.OsobyTabela.Kolumny.ADRES_UUID, osoba.getAdres().getIdAdres());
+            wymaganyJeden(database.adresDao().aktualizujAdres(encja));
         }
-        return values;
     }
 
-    public static ContentValues getContentValuesAdres(Adres adres) {
-        sprawdzUuid(adres.getIdAdres());
-        ContentValues values = new ContentValues();
-        values.put(OsobyDB.AdresTabela.Kolumny.UUID, adres.getIdAdres());
-        values.put(OsobyDB.AdresTabela.Kolumny.MIASTO, adres.getMiasto());
-        values.put(OsobyDB.AdresTabela.Kolumny.ULICA, adres.getUlica());
-        values.put(OsobyDB.AdresTabela.Kolumny.NUMER_DOMU, adres.getNumerDomu());
-        values.put(OsobyDB.AdresTabela.Kolumny.KOD_POCZTOWY, adres.getKodPocztowy());
-        return values;
-    }
-
-    private Osoba wymaganaOsoba(String uuid) {
-        Osoba osoba = pobierzOsobe(uuid);
-        if (osoba == null) {
-            throw new SQLiteException("Osoba nie istnieje: " + uuid);
-        }
+    private OsobaEntity wymaganaOsoba(String uuid) {
+        OsobaEntity osoba = database.osobaDao().pobierzOsobe(uuid);
+        if (osoba == null) throw new IllegalStateException("Osoba nie istnieje");
         return osoba;
     }
 
     private static void wymaganyJeden(int count) {
-        if (count != 1) {
-            throw new SQLiteException("Oczekiwano zmiany jednego rekordu, zmieniono: " + count);
-        }
+        if (count != 1) throw new IllegalStateException("Oczekiwano zmiany jednego rekordu: " + count);
     }
 
     private static void sprawdzUuid(String uuid) {
-        if (uuid == null || uuid.isEmpty()) {
-            throw new IllegalArgumentException("UUID nie może być pusty");
+        if (uuid == null || uuid.isEmpty()) throw new IllegalArgumentException("UUID nie może być pusty");
+    }
+
+    private static OsobaEntity encja(Osoba osoba) {
+        if (osoba == null) throw new IllegalArgumentException("Brak osoby");
+        sprawdzUuid(osoba.getmIdOsoba());
+        OsobaEntity encja = new OsobaEntity();
+        encja.uuid = osoba.getmIdOsoba();
+        encja.imie = osoba.getImie();
+        encja.nazwisko = osoba.getNazwisko();
+        if (osoba.getAdres() != null) {
+            sprawdzUuid(osoba.getAdres().getIdAdres());
+            encja.adresUuid = osoba.getAdres().getIdAdres();
         }
+        return encja;
+    }
+
+    private static AdresEntity encjaAdresu(Adres adres) {
+        if (adres == null) throw new IllegalArgumentException("Brak adresu");
+        sprawdzUuid(adres.getIdAdres());
+        AdresEntity encja = new AdresEntity();
+        encja.uuid = adres.getIdAdres();
+        encja.miasto = adres.getMiasto();
+        encja.ulica = adres.getUlica();
+        encja.numerDomu = adres.getNumerDomu();
+        encja.kodPocztowy = adres.getKodPocztowy();
+        return encja;
+    }
+
+    private static Osoba model(OsobaZAdresem relacja) {
+        Osoba osoba = new Osoba();
+        osoba.setmIdOsoba(relacja.osoba.uuid);
+        osoba.setImie(relacja.osoba.imie);
+        osoba.setNazwisko(relacja.osoba.nazwisko);
+        if (relacja.adres != null) {
+            AdresEntity encja = relacja.adres;
+            Adres adres = new Adres(encja.miasto, encja.ulica, encja.numerDomu, encja.kodPocztowy);
+            adres.setIdAdres(encja.uuid);
+            osoba.setAdres(adres);
+        }
+        return osoba;
+    }
+
+    private static Osoba kopiuj(Osoba zrodlo) {
+        if (zrodlo == null) return null;
+        Osoba kopia = new Osoba();
+        kopia.setmIdOsoba(zrodlo.getmIdOsoba());
+        kopia.setImie(zrodlo.getImie());
+        kopia.setNazwisko(zrodlo.getNazwisko());
+        kopia.setAdres(kopiujAdres(zrodlo.getAdres()));
+        return kopia;
+    }
+
+    static Adres kopiujAdres(Adres zrodlo) {
+        if (zrodlo == null) return null;
+        Adres kopia = new Adres(zrodlo.getMiasto(), zrodlo.getUlica(),
+                zrodlo.getNumerDomu(), zrodlo.getKodPocztowy());
+        kopia.setIdAdres(zrodlo.getIdAdres());
+        return kopia;
     }
 }

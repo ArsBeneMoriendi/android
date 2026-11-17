@@ -1,4 +1,5 @@
 <resources>
+    <string name="ponow_odczyt">Ponów wczytywanie</string>
     <string name="app_name">Druga_gr2</string>
     <string name="adres_miasto">Miasto</string>
     <string name="adres_ulica">Ulica</string>

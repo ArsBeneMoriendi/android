@@ -1,6 +1,5 @@
 package com.example.druga_gr2;
 
-import android.database.sqlite.SQLiteException;
 import android.os.Bundle;
 import android.util.Log;
 
@@ -20,8 +19,7 @@ import android.widget.ListView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Locale;
+import java.util.List;
 
 
 public class ListaOsobFragment extends Fragment {
@@ -30,17 +28,12 @@ public class ListaOsobFragment extends Fragment {
     private Button btnDodaj;
     private Button btnFiltruj;
     private ArrayAdapter<Osoba> adapterOsob;
-    private ListaOsob listaOsob;
     private ParametryFiltrowania parametryFiltrowania;
     private static final String STAN_FILTRA = "stan_filtra";
+    private long numerZapytania;
 
     public ListaOsobFragment() {
         // Required empty public constructor
-    }
-
-    public static ListaOsobFragment newInstance(String param1, String param2) {
-        ListaOsobFragment fragment = new ListaOsobFragment();
-        return fragment;
     }
 
     @Override
@@ -100,7 +93,14 @@ public class ListaOsobFragment extends Fragment {
     }
 
     @Override
+    public void onPause() {
+        numerZapytania++;
+        super.onPause();
+    }
+
+    @Override
     public void onDestroyView() {
+        numerZapytania++;
         super.onDestroyView();
         adapterOsob = null;
         lvListaOsob = null;
@@ -157,40 +157,28 @@ public class ListaOsobFragment extends Fragment {
         });
     }
     private void odswiezListe(){
-        if (adapterOsob == null) {
+        if (adapterOsob == null || !isResumed()) {
             return;
         }
-        ArrayList<Osoba> wynik = new ArrayList<>();
-        String tekst = parametryFiltrowania.getTekst().trim().toLowerCase(Locale.ROOT);
-
-        //filtrowanie
-        try {
-            listaOsob = ListaOsob.get(requireContext());
-            for (Osoba osoba : listaOsob.pobierzOsoby()) {
-                String imie = osoba.getImie() == null ? "" : osoba.getImie();
-                String nazwisko = osoba.getNazwisko() == null ? "" : osoba.getNazwisko();
-                String nazwa = (imie + " " + nazwisko).toLowerCase(Locale.ROOT);
-                if (nazwa.contains(tekst)) {
-                    wynik.add(osoba);
+        long zapytanie = ++numerZapytania;
+        String tekst = parametryFiltrowania.getTekst();
+        boolean rosnaco = parametryFiltrowania.isSortowanieRosnaco();
+        ListaOsob listaOsob = ListaOsob.get(requireContext());
+        listaOsob.pobierzOsoby(new ListaOsob.Callback<List<Osoba>>() {
+            @Override public void onSuccess(List<Osoba> osoby) {
+                if (zapytanie != numerZapytania || adapterOsob == null || !isResumed()) return;
+                List<Osoba> wynik = FiltrowanieOsob.zastosuj(osoby, tekst, rosnaco);
+                adapterOsob.setNotifyOnChange(false);
+                adapterOsob.clear();
+                adapterOsob.addAll(wynik);
+                adapterOsob.notifyDataSetChanged();
+            }
+            @Override public void onError(Exception e) {
+                Log.e("ListaOsobFragment", "Nie udało się odczytać listy osób", e);
+                if (zapytanie == numerZapytania && adapterOsob != null && isResumed()) {
+                    Toast.makeText(requireContext(), R.string.blad_odczytu, Toast.LENGTH_LONG).show();
                 }
             }
-        } catch (SQLiteException e) {
-            Log.e("ListaOsobFragment", "Nie udało się odczytać listy osób", e);
-            Toast.makeText(requireContext(), R.string.blad_odczytu, Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        //Sortowanie według nazwiska
-        Comparator<Osoba> comparator = Comparator.comparing(Osoba::getNazwisko,
-                Comparator.nullsFirst(String.CASE_INSENSITIVE_ORDER));
-        if(!parametryFiltrowania.isSortowanieRosnaco()){
-            comparator = comparator.reversed();
-        }
-        wynik.sort(comparator);
-
-        adapterOsob.setNotifyOnChange(false);
-        adapterOsob.clear();
-        adapterOsob.addAll(wynik);
-        adapterOsob.notifyDataSetChanged();
+        });
     }
 }
